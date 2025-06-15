@@ -74,6 +74,12 @@ MONTHLY_STATS_CHANNEL_ID: int = 1313069444272099449  # 統計表示先（月ご�
 ADMIN_ROLE_ID = 991112832655560825  # 管理者ロールID（手動追加用）
 SCHEDULE_MESSAGE_ID: int = 1377625660897624205        # 面接官の予定が書かれているメッセージ ID
 MANAGER_USER_ID:    int = 360280438654238720          # 推薦結果を DM する相手
+# 推薦DM通知で除外するユーザーID一覧
+RECOMMEND_DM_EXCLUDE_IDS: set[int] = {
+    294729244712632322,
+    278138935023239168,
+    426215439761276939,
+}
 # 「候補者」と見なすロール
 CANDIDATE_ROLE_IDS: set[int] = {
     784723518402592803,     # SPECIFIC_ROLE_ID
@@ -603,21 +609,24 @@ async def auto_assign_interviewer(
     # ⑤ 管理者へ推薦リストをDMで通知 (既存の処理)
     admin = bot.get_user(MANAGER_USER_ID)
     if admin:
-        try:
-            counts = _count_by_interviewer_this_month()
-            lines = [
-                f"- <@{uid}> (今月 {counts.get(uid, 0)} 回)"
-                for uid in recommended_ids
-            ]
-            await admin.send(
-                f"🔔 **{candidate_channel.mention}**\n"
-                f"⏩ 推奨面接官（優先順）\n"
-                + "\n".join(lines)
-                + "\n(候補者の希望時間・予定表・回数を総合評価 / Gemini 推薦)"
-            )
-            logger.info("[autoAssign] 管理者への推薦結果DM送信完了")
-        except Exception as e:
-            logger.error(f"[autoAssign] 管理者への推薦結果DM失敗: {e}")
+        filtered_dm_ids = [uid for uid in recommended_ids
+                           if uid not in RECOMMEND_DM_EXCLUDE_IDS]
+        if filtered_dm_ids:
+            try:
+                counts = _count_by_interviewer_this_month()
+                lines = [
+                    f"- <@{uid}> (今月 {counts.get(uid, 0)} 回)"
+                    for uid in filtered_dm_ids
+                ]
+                await admin.send(
+                    f"🔔 **{candidate_channel.mention}**\n"
+                    f"⏩ 推奨面接官（優先順）\n"
+                    + "\n".join(lines)
+                    + "\n(候補者の希望時間・予定表・回数を総合評価 / Gemini 推薦)"
+                )
+                logger.info("[autoAssign] 管理者への推薦結果DM送信完了")
+            except Exception as e:
+                logger.error(f"[autoAssign] 管理者への推薦結果DM失敗: {e}")
 
     logger.info("[autoAssign] --- 担当者自動割り当て処理完了 ---")
 
@@ -652,6 +661,13 @@ async def send_recommendation_dm(
     logger.info(f"[recommendDM] recommended_ids={recommended_ids}")
     if not recommended_ids:
         logger.warning("[recommendDM] Gemini から有効な推薦が得られませんでした。")
+        return
+
+    # 除外対象をフィルタリング
+    recommended_ids = [uid for uid in recommended_ids
+                       if uid not in RECOMMEND_DM_EXCLUDE_IDS]
+    if not recommended_ids:
+        logger.info("[recommendDM] 推薦候補が除外対象のみのため DM を送信しません。")
         return
 
     # ④ 管理者 DM
