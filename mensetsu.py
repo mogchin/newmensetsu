@@ -74,6 +74,11 @@ MONTHLY_STATS_CHANNEL_ID: int = 1313069444272099449  # 統計表示先（月ご�
 ADMIN_ROLE_ID = 991112832655560825  # 管理者ロールID（手動追加用）
 SCHEDULE_MESSAGE_ID: int = 1377625660897624205        # 面接官の予定が書かれているメッセージ ID
 MANAGER_USER_ID:    int = 360280438654238720          # 推薦結果を DM する相手
+RECOMMEND_DM_EXCLUDE_IDS: set[int] = {
+    294729244712632322,
+    278138935023239168,
+    426215439761276939,
+}
 # 「候補者」と見なすロール
 CANDIDATE_ROLE_IDS: set[int] = {
     784723518402592803,     # SPECIFIC_ROLE_ID
@@ -652,6 +657,11 @@ async def send_recommendation_dm(
     logger.info(f"[recommendDM] recommended_ids={recommended_ids}")
     if not recommended_ids:
         logger.warning("[recommendDM] Gemini から有効な推薦が得られませんでした。")
+        return
+
+    recommended_ids = [uid for uid in recommended_ids if uid not in RECOMMEND_DM_EXCLUDE_IDS]
+    if not recommended_ids:
+        logger.info("[recommendDM] All recommended IDs were excluded; skipping DM")
         return
 
     # ④ 管理者 DM
