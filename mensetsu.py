@@ -1208,6 +1208,29 @@ async def notify_interviewer_assignment(
         logger.error(f"担当者への割り当てDM送信中にエラーが発生しました: {e}")
 
 
+async def notify_interviewer_schedule(
+    interviewer: discord.abc.User,
+    candidate_member: discord.Member,
+    candidate_channel: discord.TextChannel,
+    schedule_time: datetime,
+) -> None:
+    """面接担当者に面接日時を通知"""
+    try:
+        await interviewer.send(
+            "⏰ **面接日時が設定されました** ⏰\n\n"
+            f"候補者: **{candidate_member.display_name}**\n"
+            f"日時: {schedule_time.strftime('%m/%d %H:%M')}\n"
+            f"チャンネル: {candidate_channel.mention}"
+        )
+        logger.info(f"担当者 {interviewer.id} へ面接日時DMを送信しました")
+    except discord.Forbidden:
+        logger.warning(
+            f"担当者 {interviewer.id} への面接日時DMがブロックされており、送信できませんでした。"
+        )
+    except Exception as e:
+        logger.error(f"担当者への面接日時DM送信中にエラーが発生しました: {e}")
+
+
 def get_interviewer_role(guild: discord.Guild) -> Optional[discord.Role]:
     if guild.id == MAIN_GUILD_ID:
         role: Optional[discord.Role] = guild.get_role(INTERVIEWER_ROLE_ID)
@@ -2293,6 +2316,20 @@ class ScheduleModal(discord.ui.Modal, title="面接日時の入力"):
             update_candidate_status(cp, "日程調整済み")
             await data_manager.save_data()
             request_dashboard_update(interaction.client)
+            interviewer_user = interaction.client.get_user(self.interviewer_id)
+            candidate_user = interaction.client.get_user(cp.get('candidate_id'))
+            channel_obj = interaction.client.get_channel(cp.get('channel_id'))
+            if (
+                interviewer_user
+                and candidate_user
+                and isinstance(channel_obj, discord.TextChannel)
+            ):
+                await notify_interviewer_schedule(
+                    interviewer_user,
+                    candidate_user,
+                    channel_obj,
+                    dt,
+                )
         await interaction.response.send_message("面接日時設定完了", ephemeral=True)
 
 # ------------------------------------------------
