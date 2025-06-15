@@ -1928,13 +1928,17 @@ class VCControlView(discord.ui.View):
 
         # --- 3) 進捗 & マッピング更新 --------------------------
         cp['voice_channel_id'] = vc.id
-        if cp.get('interviewer_id') is None:
-            cp['interviewer_id'] = interaction.user.id
+        prev_id = cp.get('interviewer_id')
+        cp['previous_interviewer_id'] = prev_id
+        cp['interviewer_id'] = interaction.user.id
+        changed = prev_id != interaction.user.id
+        if changed:
+            cp['notified_assignment'] = False
         data_manager.interview_channel_mapping[vc.id] = progress_key
         await data_manager.save_data()
 
         # --- 3.5) 割り当て通知 -------------------------------
-        if cp.get('interviewer_id') == interaction.user.id:
+        if changed:
             await notify_interviewer_assignment(
                 interaction.user,
                 target_member,
@@ -2049,17 +2053,23 @@ class VCControlView(discord.ui.View):
         )
 
         # ── **担当者を上書き** ───────────────────────────────
+        prev_id = cp.get("interviewer_id")
+        cp["previous_interviewer_id"] = prev_id
         cp["interviewer_id"] = interaction.user.id
+        changed = prev_id != interaction.user.id
+        if changed:
+            cp["notified_assignment"] = False
         await data_manager.save_data()
         request_dashboard_update(interaction.client)
 
         # ── 担当者へDM通知 ─────────────────────────────
-        await notify_interviewer_assignment(
-            interaction.user,
-            target_member,
-            interaction.channel,
-            cp,
-        )
+        if changed:
+            await notify_interviewer_assignment(
+                interaction.user,
+                target_member,
+                interaction.channel,
+                cp,
+            )
 
         # ── モーダル表示 ─────────────────────────────────
         modal = ScheduleModal(progress_key, interaction.user.id)
@@ -2085,9 +2095,23 @@ class VCControlView(discord.ui.View):
         )
 
         # ── **担当者を上書き** ───────────────────────────────
+        prev_id = cp.get("interviewer_id")
+        cp["previous_interviewer_id"] = prev_id
         cp["interviewer_id"] = interaction.user.id
+        changed = prev_id != interaction.user.id
+        if changed:
+            cp["notified_assignment"] = False
         await data_manager.save_data()
         request_dashboard_update(interaction.client)
+
+        # ── 担当者へDM通知 ------------------------------
+        if changed:
+            await notify_interviewer_assignment(
+                interaction.user,
+                target_member,
+                interaction.channel,
+                cp,
+            )
 
         # ── モーダル表示 ─────────────────────────────────
         modal = MemoModal(progress_key,
@@ -2261,6 +2285,7 @@ class ScheduleModal(discord.ui.Modal, title="面接日時の入力"):
         cp: Optional[Dict[str, Any]] = data_manager.candidate_progress.get(self.progress_key)
         if cp:
             cp['interview_time'] = dt.isoformat()
+            cp['previous_interviewer_id'] = cp.get('interviewer_id')
             cp['interviewer_id'] = self.interviewer_id
             cp['scheduled_time'] = get_current_time_iso()
             cp['notified_candidate'] = False
@@ -2748,6 +2773,7 @@ class EventCog(commands.Cog):
             'timestamp': get_current_time_iso(),
             'interview_time': None,
             'interviewer_id': None,
+            'previous_interviewer_id': None,
             'join_time': get_current_time_iso(),
             'profile_filled_time': None,
             'scheduled_time': None,
