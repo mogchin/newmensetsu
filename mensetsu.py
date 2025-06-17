@@ -2627,16 +2627,20 @@ class GuideCountCog(commands.Cog):
         if specific in after.roles and specific not in before.roles:
             # 付与者（AuditLog）を取得
             assigner: Optional[discord.Member] = None
-            async for entry in after.guild.audit_logs(limit=5, action=AuditLogAction.member_role_update):
+            async for entry in after.guild.audit_logs(limit=10, action=AuditLogAction.member_role_update):
                 if entry.target.id != after.id:
                     continue
                 b_ids = [r.id for r in getattr(entry.before, "roles", [])]
                 a_ids = [r.id for r in getattr(entry.after,  "roles", [])]
                 if specific.id in a_ids and specific.id not in b_ids:
-                    assigner = entry.user if isinstance(entry.user, discord.Member) else None
+                    if isinstance(entry.user, discord.Member):
+                        assigner = entry.user
+                    else:
+                        assigner = after.guild.get_member(entry.user.id)
                     break
 
             if not assigner or guide not in assigner.roles:
+                logger.debug("GuideCountCog: assigner not found or lacks guide role")
                 return
 
             ym   = self.current_ym
