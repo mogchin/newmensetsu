@@ -2874,12 +2874,9 @@ class EventCog(commands.Cog):
     async def on_member_remove(self, member: discord.Member):
         """
         メンバーがサーバーから退出した際のイベントハンドラ
-        - 担当者がいる候補者の場合、担当者にDMで通知する（面接済みを除く）
+        - メイン / サブ問わず、担当者がいる候補者の場合にDMで通知する（面接済みを除く）
         - 関連するチャンネルやデータをクリーンアップする
         """
-        # 処理対象はメインサーバー(MAIN_GUILD_ID)のメンバーのみ
-        if member.guild.id != MAIN_GUILD_ID:
-            return
 
         # 退出したメンバーが管理対象の「候補者」であったかを確認
         progress_key = make_progress_key(member.guild.id, member.id)
