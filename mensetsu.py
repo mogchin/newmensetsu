@@ -2627,16 +2627,20 @@ class GuideCountCog(commands.Cog):
         if specific in after.roles and specific not in before.roles:
             # 付与者（AuditLog）を取得
             assigner: Optional[discord.Member] = None
-            async for entry in after.guild.audit_logs(limit=5, action=AuditLogAction.member_role_update):
+            async for entry in after.guild.audit_logs(limit=10, action=AuditLogAction.member_role_update):
                 if entry.target.id != after.id:
                     continue
                 b_ids = [r.id for r in getattr(entry.before, "roles", [])]
                 a_ids = [r.id for r in getattr(entry.after,  "roles", [])]
                 if specific.id in a_ids and specific.id not in b_ids:
-                    assigner = entry.user if isinstance(entry.user, discord.Member) else None
+                    if isinstance(entry.user, discord.Member):
+                        assigner = entry.user
+                    else:
+                        assigner = after.guild.get_member(entry.user.id)
                     break
 
             if not assigner or guide not in assigner.roles:
+                logger.debug("GuideCountCog: assigner not found or lacks guide role")
                 return
 
             ym   = self.current_ym
@@ -2874,12 +2878,9 @@ class EventCog(commands.Cog):
     async def on_member_remove(self, member: discord.Member):
         """
         メンバーがサーバーから退出した際のイベントハンドラ
-        - 担当者がいる候補者の場合、担当者にDMで通知する（面接済みを除く）
+        - メイン / サブ問わず、担当者がいる候補者の場合にDMで通知する（面接済みを除く）
         - 関連するチャンネルやデータをクリーンアップする
         """
-        # 処理対象はメインサーバー(MAIN_GUILD_ID)のメンバーのみ
-        if member.guild.id != MAIN_GUILD_ID:
-            return
 
         # 退出したメンバーが管理対象の「候補者」であったかを確認
         progress_key = make_progress_key(member.guild.id, member.id)
