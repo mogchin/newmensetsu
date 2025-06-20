@@ -3471,8 +3471,8 @@ class MessageCog(commands.Cog):
         if current_status in ("プロフィール未記入", "要修正") and looks_like_profile(message.content):
             await self._process_profile(message, cp, progress_key)
         
-        # C-2. プロフィール記入済みで、担当者も決まっている場合
-        elif current_status == "記入済み" and cp.get("interviewer_id"):
+        # C-2. プロフィール記入済みや日程調整中で、担当者も決まっている場合
+        elif current_status in ("記入済み", "担当者待ち") and cp.get("interviewer_id"):
             # 候補者からのメンションや返信以外のメッセージを担当者にDM通知
             if not message.mentions and not message.reference:
                  await notify_interviewer_of_candidate_message(self.bot, cp, message)
