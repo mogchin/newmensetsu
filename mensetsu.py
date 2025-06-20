@@ -2951,6 +2951,34 @@ class EventCog(commands.Cog):
             # 3. ダッシュボードの表示を最新の状態に更新
             # 修正点: bot を self.bot に修正
             request_dashboard_update(self.bot)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
+        """特定ロール付与時に候補者データをクリーンアップ"""
+        if before.roles == after.roles:
+            return
+
+        role_added = any(r.id == EXEMPT_ROLE_ID for r in after.roles) and all(
+            r.id != EXEMPT_ROLE_ID for r in before.roles
+        )
+        if not role_added:
+            return
+
+        progress_key = make_progress_key(after.guild.id, after.id)
+        if progress_key not in data_manager.candidate_progress:
+            return
+
+        try:
+            await delete_candidate_channels(self.bot, after.guild, after.id)
+        except Exception as e:
+            logger.error(f"ロール付与によるチャンネル削除失敗: {e}")
+
+        data_manager.candidate_progress.pop(progress_key, None)
+        await data_manager.save_data()
+        request_dashboard_update(self.bot)
+        logger.info(
+            f"ロール {EXEMPT_ROLE_ID} 付与により候補者 {after.id} の進捗を削除しました。"
+        )
 # ------------------------------------------------
 # TaskCog（定期タスク）
 # ------------------------------------------------
@@ -2964,6 +2992,22 @@ class TaskCog(commands.Cog):
     async def check_candidate_status(self) -> None:
         now: datetime = datetime.now(JST)
         for progress_key, cp in list(data_manager.candidate_progress.items()):
+            # 候補者が既にサーバーから退出していないか確認
+            candidate_id = cp.get("candidate_id")
+            guild_id = cp.get("source_guild_id", MAIN_GUILD_ID)
+            guild = self.bot.get_guild(guild_id)  # type: ignore
+            if not guild:
+                continue
+            if guild.get_member(candidate_id) is None:
+                try:
+                    await delete_candidate_channels(self.bot, guild, candidate_id)
+                except Exception as e:
+                    logger.error(f"退出候補者 {candidate_id} のチャンネル削除失敗: {e}")
+                data_manager.candidate_progress.pop(progress_key, None)
+                await data_manager.save_data()
+                request_dashboard_update(self.bot)
+                logger.info(f"候補者 {candidate_id} が既に退出していたため進捗を削除")
+                continue
             # ★ 変更点: AI評価が一度でも行われていれば、自動リマインド・キックをスキップ
             if cp.get("profile_evaluated", False):
                 continue
@@ -2984,7 +3028,6 @@ class TaskCog(commands.Cog):
             if channel is None:
                 continue
 
-            candidate_id = cp.get("candidate_id")
             candidate: Optional[discord.User] = self.bot.get_user(candidate_id) # type: ignore
             if candidate is None:
                 continue
@@ -3428,8 +3471,8 @@ class MessageCog(commands.Cog):
         if current_status in ("プロフィール未記入", "要修正") and looks_like_profile(message.content):
             await self._process_profile(message, cp, progress_key)
         
-        # C-2. プロフィール記入済みで、担当者も決まっている場合
-        elif current_status == "記入済み" and cp.get("interviewer_id"):
+        # C-2. プロフィール記入済みまたは日程調整中で、担当者も決まっている場合
+        elif current_status in ("記入済み", "担当者待ち") and cp.get("interviewer_id"):
             # 候補者からのメンションや返信以外のメッセージを担当者にDM通知
             if not message.mentions and not message.reference:
                  await notify_interviewer_of_candidate_message(self.bot, cp, message)
