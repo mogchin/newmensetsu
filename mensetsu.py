@@ -1485,6 +1485,20 @@ async def get_candidate_context(
         return None
 
     # ─────────────────────────────────────────────
+    # 4-B) ボタンを押した人の権限確認
+    #      ・担当者本人、または面接担当ロールを持つメンバーのみ許可
+    # ─────────────────────────────────────────────
+    if not (
+        main_member
+        and (
+            main_member.id == interviewer_id
+            or interviewer_role in main_member.roles
+        )
+    ):
+        await send_error("操作権限がありません。")
+        return None
+
+    # ─────────────────────────────────────────────
     # 5) 対象候補者 (guild / member) を探す
     # ─────────────────────────────────────────────
     guild_ids: list[int] = []
