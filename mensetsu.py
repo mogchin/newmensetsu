@@ -980,34 +980,19 @@ async def delete_candidate_channels(
     progress_key = make_progress_key(guild.id, candidate_id)
 
     # ---------- テキストチャンネル削除 ----------
-    cp = data_manager.candidate_progress.get(progress_key)
-    text_channel_id: Optional[int] = None
-    if cp:
-        text_channel_id = cp.get("channel_id")
-
-    if text_channel_id:
-        ch = guild.get_channel(text_channel_id)
-        if isinstance(ch, discord.TextChannel):
+    for ch in guild.text_channels:
+        if data_manager.interview_channel_mapping.get(ch.id) == progress_key:
             try:
                 await ch.delete()
                 logger.info(f"候補者 {candidate_id} のテキストチャンネル {ch.id} を削除")
             except Exception as e:
                 logger.error(f"テキストチャンネル {ch.id} 削除失敗: {e}")
             data_manager.interview_channel_mapping.pop(ch.id, None)
-    else:
-        # mapping から検索して削除
-        for ch in guild.text_channels:
-            if data_manager.interview_channel_mapping.get(ch.id) == progress_key:
-                try:
-                    await ch.delete()
-                    logger.info(f"候補者 {candidate_id} のテキストチャンネル {ch.id} を削除")
-                except Exception as e:
-                    logger.error(f"テキストチャンネル {ch.id} 削除失敗: {e}")
-                data_manager.interview_channel_mapping.pop(ch.id, None)
-                break
+            break
 
     # ---------- VC 削除 ----------
     # 1) cp 由来の voice_channel_id
+    cp = data_manager.candidate_progress.get(progress_key)
     vc_candidates: list[int] = []
     if cp and cp.get("voice_channel_id"):
         vc_candidates.append(cp["voice_channel_id"])
@@ -1496,6 +1481,20 @@ async def get_candidate_context(
     interviewer = main_guild.get_member(interviewer_id) \
         or await utils.safe_fetch_member(main_guild, interviewer_id)
     if interviewer is None or interviewer_role not in interviewer.roles:
+        await send_error("操作権限がありません。")
+        return None
+
+    # ─────────────────────────────────────────────
+    # 4-B) ボタンを押した人の権限確認
+    #      ・担当者本人、または面接担当ロールを持つメンバーのみ許可
+    # ─────────────────────────────────────────────
+    if not (
+        main_member
+        and (
+            main_member.id == interviewer_id
+            or interviewer_role in main_member.roles
+        )
+    ):
         await send_error("操作権限がありません。")
         return None
 
@@ -2886,58 +2885,49 @@ class EventCog(commands.Cog):
                 request_dashboard_update(self.bot)
                 logger.info(f"候補者 {progress_key} の進捗削除 (チャンネル削除)")
 
-    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-    # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼ 修正箇所 ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
         """
         メンバーがサーバーから退出した際のイベントハンドラ
-        - メイン / サブ問わず、担当者がいる候補者の場合にDMで通知する（面接済みを除く）
+        - メイン / サブ問わず、担当者がいる候補者の場合にDMで通知する
+        （面接がまだ完了していない場合）
         - 関連するチャンネルやデータをクリーンアップする
         """
-
-        # 退出したメンバーが管理対象の「候補者」であったかを確認
         progress_key = make_progress_key(member.guild.id, member.id)
         cp = data_manager.candidate_progress.get(progress_key)
 
-        # 候補者データが存在しない場合は、ここで処理を終了
         if not cp:
             return
 
         logger.info(f"候補者 '{member.display_name}' ({member.id}) がサーバーから退出しました。クリーンアップ処理を開始します。")
 
-        # --- 担当者への通知判定 ---
-        is_interview_completed = False
-        
-        # 1. 完了済みステータスで判定
-        # 面接が完了したことを示すステータスのセット
+        # --- 面接が完了していたかどうかの判定ロジックを整理 ---
         completed_statuses = {
             'PASS_NOTIFIED', 'DELAY_PASS', 'FAIL_NOTIFIED', 'DELAY_FAIL',
-            'BAN_NOTIFIED', 'DELAY_BAN', 'INTERVAL_NOTIFIED', 'DELAY_INTERVAL'
+            'BAN_NOTIFIED', 'DELAY_BAN', 'INTERVAL_NOTIFIED', 'DELAY_INTERVAL',
+            '面接済み'  # このステータスも完了とみなす
         }
-        if cp.get("status") in completed_statuses:
-            is_interview_completed = True
 
-        # 2. 面接記録(interview_records)の有無で判定 (より確実)
-        if not is_interview_completed:
-            # 修正点: キーを "candidate_id" から "interviewee_id" に修正
-            if any(r.get("interviewee_id") == member.id for r in data_manager.interview_records):
-                is_interview_completed = True
-                
-        # 担当者が割り当てられており、かつ面接が完了していない場合のみDMを送信
+        # interview_records内のIDは文字列の可能性があるため str() で比較
+        has_interview_record = any(
+            str(r.get("candidate_id")) == str(member.id)
+            for r in data_manager.interview_records
+        )
+        
+        # 「完了ステータス」または「面接記録あり」のいずれかで完了とみなす
+        is_interview_completed = (cp.get("status") in completed_statuses) or has_interview_record
+        
+        # --- 担当者への通知 ---
         interviewer_id = cp.get("interviewer_id")
+        
+        # ★ 修正点2: 通知条件を「担当者がいて、かつ面接未完了」に簡素化 ★
         if interviewer_id and not is_interview_completed:
             try:
-                # 担当者のユーザーオブジェクトを取得
-                # 修正点: bot を self.bot に修正
                 interviewer = await self.bot.fetch_user(interviewer_id)
                 if interviewer:
-                    # 担当者へDMを送信
                     await interviewer.send(
                         f"【担当候補者 サーバー退出のお知らせ】\n\n"
                         f"担当されていた候補者「{member.display_name}」さんがサーバーから退出しました。\n"
-                        f"関連データは自動的にクリーンアップされます。"
                     )
                     logger.info(f"候補者 {member.id} の退出を担当者 {interviewer_id} にDMで通知しました。")
             except discord.NotFound:
@@ -2946,25 +2936,24 @@ class EventCog(commands.Cog):
                 logger.warning(f"担当者 {interviewer_id} へのDMがブロックされており、退出DMを送信できませんでした。")
             except Exception as e:
                 logger.error(f"担当者への退出通知DM送信中に予期せぬエラーが発生しました: {e}", exc_info=True)
-
+        else:
+            # (改善) 通知しなかった場合に理由をログ出力し、デバッグしやすくする
+            if interviewer_id:
+                reason = "面接完了済みのため"
+            else:
+                reason = "担当者が未設定のため"
+            logger.info(f"候補者 {member.id} の退出通知は送信しませんでした。理由: {reason}")
 
         # --- 候補者データのクリーンアップ処理 ---
-        
-        # 1. 関連するテキストチャンネル・ボイスチャンネルを削除
         try:
-            # 修正点: bot を self.bot に修正
             await delete_candidate_channels(self.bot, member.guild, member.id)
         except Exception as e:
             logger.error(f"退出した候補者 {member.id} のチャンネル削除中にエラーが発生しました: {e}", exc_info=True)
 
-        # 2. `candidate_progress` から該当候補者のデータを削除
         if progress_key in data_manager.candidate_progress:
             del data_manager.candidate_progress[progress_key]
             await data_manager.save_data()
             logger.info(f"退出した候補者 {member.id} の進捗データを削除しました。")
-
-            # 3. ダッシュボードの表示を最新の状態に更新
-            # 修正点: bot を self.bot に修正
             request_dashboard_update(self.bot)
 
     @commands.Cog.listener()
@@ -3002,7 +2991,6 @@ class TaskCog(commands.Cog):
         self.bot = bot
         self.check_candidate_status.start()
         self.schedule_notifications.start()
-        self.cleanup_orphan_channels.start()
 
     @tasks.loop(minutes=5)
     async def check_candidate_status(self) -> None:
@@ -3122,32 +3110,6 @@ class TaskCog(commands.Cog):
                     cp['notified_candidate'] = False
                     cp['notified_interviewer'] = False
                     await data_manager.save_data()
-
-    # ---------- 定期クリーンアップ ----------
-    @tasks.loop(minutes=10)
-    async def cleanup_orphan_channels(self) -> None:
-        for progress_key, cp in list(data_manager.candidate_progress.items()):
-            guild_id = cp.get('source_guild_id', MAIN_GUILD_ID)
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                continue
-            candidate_id = cp.get('candidate_id')
-            if candidate_id is None:
-                continue
-            if guild.get_member(candidate_id):
-                continue
-            try:
-                await delete_candidate_channels(self.bot, guild, candidate_id)
-            except Exception as e:
-                logger.error(f"孤立チャンネル削除失敗: {e}")
-            data_manager.candidate_progress.pop(progress_key, None)
-            await data_manager.save_data()
-            request_dashboard_update(self.bot)
-            logger.info(f"候補者 {candidate_id} の進捗を削除しました (退出検知失敗)")
-
-    @cleanup_orphan_channels.before_loop
-    async def _before_cleanup_orphan_channels(self) -> None:
-        await self.bot.wait_until_ready()
 # ------------------------------------------------
 # DelayedActionManager（遅延アクション管理）
 # ------------------------------------------------
@@ -3513,11 +3475,15 @@ class MessageCog(commands.Cog):
         if current_status in ("プロフィール未記入", "要修正") and looks_like_profile(message.content):
             await self._process_profile(message, cp, progress_key)
         
-        # C-2. プロフィール記入済みや日程調整中で、担当者も決まっている場合
-        elif current_status in ("記入済み", "担当者待ち") and cp.get("interviewer_id"):
+        # C-2. プロフィール審査完了済みで担当者が決まっている場合
+        elif (
+            cp.get("interviewer_id")
+            and cp.get("profile_evaluated")
+            and current_status != "面接済み"
+        ):
             # 候補者からのメンションや返信以外のメッセージを担当者にDM通知
             if not message.mentions and not message.reference:
-                 await notify_interviewer_of_candidate_message(self.bot, cp, message)
+                await notify_interviewer_of_candidate_message(self.bot, cp, message)
 
     # ===== on_message_edit: 編集の処理 ===========================
     @commands.Cog.listener()
