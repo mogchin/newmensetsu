@@ -2974,6 +2974,57 @@ class EventCog(commands.Cog):
             request_dashboard_update(self.bot)
 
     @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """候補者が面接VCから離脱した際に担当者へ通知"""
+
+        # 退出前にいたVCが管理対象でなければ終了
+        if before.channel is None:
+            return
+        progress_key = data_manager.interview_channel_mapping.get(before.channel.id)
+        if not progress_key:
+            return
+        cp = data_manager.candidate_progress.get(progress_key)
+        if not cp:
+            return
+
+        # 離脱したメンバーが候補者本人か確認
+        if cp.get("candidate_id") != member.id:
+            return
+
+        # 当該 VC から退出した（接続先が None）のみを対象
+        if after.channel is not None:
+            return
+
+        interviewer_id: Optional[int] = cp.get("interviewer_id")
+        if not interviewer_id:
+            return
+
+        try:
+            interviewer = await self.bot.fetch_user(interviewer_id)
+            if interviewer:
+                await interviewer.send(
+                    f"【担当候補者 VC退出のお知らせ】\n\n"
+                    f"候補者「{member.display_name}」さんが面接VCを退出しました。"
+                )
+                logger.info(
+                    f"候補者 {member.id} の VC退出を担当者 {interviewer_id} にDMで通知しました。"
+                )
+        except discord.Forbidden:
+            logger.warning(
+                f"担当者 {interviewer_id} へのDMがブロックされており、VC退出DMを送信できませんでした。"
+            )
+        except Exception as e:
+            logger.error(
+                f"担当者へのVC退出通知DM送信中に予期せぬエラーが発生しました: {e}",
+                exc_info=True,
+            )
+
+    @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
         """特定ロール付与時に候補者データをクリーンアップ"""
         if before.roles == after.roles:
