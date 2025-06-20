@@ -2912,7 +2912,13 @@ class EventCog(commands.Cog):
                 
         # 担当者が割り当てられており、かつ面接が完了していない場合のみDMを送信
         interviewer_id = cp.get("interviewer_id")
-        if interviewer_id and not is_interview_completed:
+        current_status = cp.get("status")
+        if (
+            interviewer_id
+            and cp.get("profile_evaluated")
+            and current_status in ("記入済み", "担当者待ち", "日程調整済み")
+            and not is_interview_completed
+        ):
             try:
                 # 担当者のユーザーオブジェクトを取得
                 # 修正点: bot を self.bot に修正
@@ -3472,10 +3478,13 @@ class MessageCog(commands.Cog):
             await self._process_profile(message, cp, progress_key)
         
         # C-2. プロフィール記入済みまたは日程調整中で、担当者も決まっている場合
-        elif current_status in ("記入済み", "担当者待ち") and cp.get("interviewer_id"):
+        elif (
+            current_status in ("記入済み", "担当者待ち", "日程調整済み")
+            and cp.get("interviewer_id")
+        ):
             # 候補者からのメンションや返信以外のメッセージを担当者にDM通知
             if not message.mentions and not message.reference:
-                 await notify_interviewer_of_candidate_message(self.bot, cp, message)
+                await notify_interviewer_of_candidate_message(self.bot, cp, message)
 
     # ===== on_message_edit: 編集の処理 ===========================
     @commands.Cog.listener()
