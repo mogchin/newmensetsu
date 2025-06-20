@@ -2878,7 +2878,8 @@ class EventCog(commands.Cog):
     async def on_member_remove(self, member: discord.Member):
         """
         メンバーがサーバーから退出した際のイベントハンドラ
-        - メイン / サブ問わず、担当者がいる候補者の場合にDMで通知する（面接済みを除く）
+        - メイン / サブ問わず、担当者がいる候補者の場合にDMで通知する
+          （プロフィール審査が完了し、かつ面接済みでない場合）
         - 関連するチャンネルやデータをクリーンアップする
         """
 
@@ -2910,9 +2911,15 @@ class EventCog(commands.Cog):
             if any(r.get("interviewee_id") == member.id for r in data_manager.interview_records):
                 is_interview_completed = True
                 
-        # 担当者が割り当てられており、かつ面接が完了していない場合のみDMを送信
+        # 担当者が割り当てられており、プロフィール審査完了かつ
+        # 面接がまだ完了していない場合のみDMを送信
         interviewer_id = cp.get("interviewer_id")
-        if interviewer_id and not is_interview_completed:
+        if (
+            interviewer_id
+            and cp.get("profile_evaluated")
+            and not is_interview_completed
+            and cp.get("status") != "面接済み"
+        ):
             try:
                 # 担当者のユーザーオブジェクトを取得
                 # 修正点: bot を self.bot に修正
@@ -3471,11 +3478,15 @@ class MessageCog(commands.Cog):
         if current_status in ("プロフィール未記入", "要修正") and looks_like_profile(message.content):
             await self._process_profile(message, cp, progress_key)
         
-        # C-2. プロフィール記入済みまたは日程調整中で、担当者も決まっている場合
-        elif current_status in ("記入済み", "担当者待ち") and cp.get("interviewer_id"):
+        # C-2. プロフィール審査完了済みで担当者が決まっている場合
+        elif (
+            cp.get("interviewer_id")
+            and cp.get("profile_evaluated")
+            and current_status != "面接済み"
+        ):
             # 候補者からのメンションや返信以外のメッセージを担当者にDM通知
             if not message.mentions and not message.reference:
-                 await notify_interviewer_of_candidate_message(self.bot, cp, message)
+                await notify_interviewer_of_candidate_message(self.bot, cp, message)
 
     # ===== on_message_edit: 編集の処理 ===========================
     @commands.Cog.listener()
