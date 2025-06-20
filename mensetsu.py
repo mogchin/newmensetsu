@@ -1586,7 +1586,13 @@ async def process_immediate_action(
         )
 
     try:
-        # ① 面接記録追加 & 進捗削除 ----------------------------------------
+        # --- 1. チャンネル削除 --------------------------------------------
+        try:
+            await delete_candidate_channels(interaction.client, target_guild, candidate_id)
+        except Exception as e:
+            logger.error(f"候補者チャンネル削除失敗: {e}")
+
+        # --- 2. 面接記録追加 & 進捗削除 -----------------------------------
         data_manager.interview_records.append({
             "date":          get_current_time_iso(),
             "interviewer_id": cp["interviewer_id"],
@@ -1597,7 +1603,7 @@ async def process_immediate_action(
         data_manager.candidate_progress.pop(progress_key, None)
         await data_manager.save_data()
 
-        # ② ダッシュボード & 統計更新 --------------------------------------
+        # --- 3. ダッシュボード & 統計更新 ---------------------------------
         request_dashboard_update(interaction.client)
         asyncio.create_task(update_stats(interaction.client))
         await update_memo_result_simple(target_member, action_type.upper())
@@ -1622,6 +1628,8 @@ async def process_immediate_action(
             f"{'✅ キック完了' if kicked else '⚠️ キックに失敗 / 既にいません'}"
         )
         await interaction.followup.send(msg, ephemeral=True)
+
+
 
     except Exception as e:
         logger.error(f"process_immediate_action 全体失敗: {e}", exc_info=True)
@@ -1654,6 +1662,7 @@ async def register_delayed_action(
         "id": str(uuid.uuid4()),
         "action_type": action_type,
         "candidate_id": candidate_id,
+        "progress_key": context.progress_key,  # 実行時に進捗を削除するためキーを渡す
         "scheduled_time": tomorrow_9.isoformat(),
         "apply_all": target_guild.id == MAIN_GUILD_ID,
         **({} if target_guild.id == MAIN_GUILD_ID else {"guild_id": target_guild.id})
@@ -1661,8 +1670,7 @@ async def register_delayed_action(
     await delayed_action_manager.add(action)
 
     # --- 面接記録・進捗 ----------------------------------------------------
-    update_candidate_status(cp, action_type.upper())
-    data_manager.candidate_progress.pop(context.progress_key, None)
+    update_candidate_status(cp, f"DELAY_{action_type.upper()}")
     data_manager.interview_records.append({
         "date":          get_current_time_iso(),
         "interviewer_id": cp["interviewer_id"],
@@ -1672,8 +1680,7 @@ async def register_delayed_action(
     await data_manager.save_data()
 
     # --- UI 更新 ----------------------------------------------------------
-    request_dashboard_update(interaction.client)
-    asyncio.create_task(update_stats(interaction.client))          # ★ 追加
+    asyncio.create_task(update_stats(interaction.client))
 
     await interaction.followup.send(
         f"{target_member.mention} の **{action_type.upper()}** を "
@@ -3201,6 +3208,8 @@ class DelayedActionManager:
 async def execute_delayed_action(action: dict, bot: commands.Bot):
     candidate_id = action["candidate_id"]
     action_type = action["action_type"]
+    progress_key = action.get("progress_key")
+
     if action_type == "ban":
         reason = "BAN (遅延キック)"
     elif action_type == "fail":
@@ -3210,39 +3219,32 @@ async def execute_delayed_action(action: dict, bot: commands.Bot):
     else:
         logger.error(f"不明なアクション種別: {action_type}")
         return
-    apply_all = action.get("apply_all", False)
 
-    if apply_all:
-        for guild in bot.guilds:
-            try:
-                member = guild.get_member(candidate_id) or await guild.fetch_member(candidate_id)
-                if member:
-                    try:
-                        await guild.kick(member, reason=reason)
-                        logger.info(f"Guild {guild.id} で候補者 {candidate_id} に対して {action_type} 遅延処理実行")
-                        # ★ 追記: 自動キックログ
-                        await log_auto_kick(bot, member, guild, reason)
-                    except Exception as e:
-                        logger.error(f"Guild {guild.id} での遅延処理 {action_type} 失敗: {e}")
-            except Exception as e:
-                logger.error(f"Guild {guild.id} で候補者 {candidate_id} の取得失敗: {e}")
-    else:
-        guild_id = action.get("guild_id")
-        if guild_id is not None:
-            guild = bot.get_guild(guild_id)
-            if guild:
-                try:
-                    member = guild.get_member(candidate_id) or await guild.fetch_member(candidate_id)
-                    if member:
-                        try:
-                            await guild.kick(member, reason=reason)
-                            logger.info(f"Guild {guild_id} で候補者 {candidate_id} に対して {action_type} 遅延処理実行")
-                            # ★ 追記: 自動キックログ
-                            await log_auto_kick(bot, member, guild, reason)
-                        except Exception as e:
-                            logger.error(f"Guild {guild_id} での遅延処理 {action_type} 失敗: {e}")
-                except Exception as e:
-                    logger.error(f"Guild {guild_id} で候補者 {candidate_id} の取得失敗: {e}")
+    apply_all = action.get("apply_all", False)
+    guilds_to_process = bot.guilds if apply_all else [bot.get_guild(action.get("guild_id"))]
+
+    for guild in guilds_to_process:
+        if not guild:
+            continue
+        try:
+            # 1. チャンネル削除
+            await delete_candidate_channels(bot, guild, candidate_id)
+
+            # 2. キック
+            member = guild.get_member(candidate_id) or await guild.fetch_member(candidate_id)
+            if member:
+                await guild.kick(member, reason=reason)
+                logger.info(f"Guild {guild.id} で候補者 {candidate_id} に対して {action_type} 遅延処理実行")
+                await log_auto_kick(bot, member, guild, reason)
+        except Exception as e:
+            logger.error(f"Guild {guild.id} での遅延処理失敗（候補者: {candidate_id}）: {e}")
+
+    # 3. 進捗データ削除
+    if progress_key and progress_key in data_manager.candidate_progress:
+        del data_manager.candidate_progress[progress_key]
+        await data_manager.save_data()
+        request_dashboard_update(bot)
+        logger.info(f"遅延処理完了に伴い、候補者 {candidate_id} の進捗データを削除しました。")
 
 # ------------------------------------------------
 # DelayedActionCog（遅延アクションの実行）
