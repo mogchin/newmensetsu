@@ -980,34 +980,19 @@ async def delete_candidate_channels(
     progress_key = make_progress_key(guild.id, candidate_id)
 
     # ---------- テキストチャンネル削除 ----------
-    cp = data_manager.candidate_progress.get(progress_key)
-    text_channel_id: Optional[int] = None
-    if cp:
-        text_channel_id = cp.get("channel_id")
-
-    if text_channel_id:
-        ch = guild.get_channel(text_channel_id)
-        if isinstance(ch, discord.TextChannel):
+    for ch in guild.text_channels:
+        if data_manager.interview_channel_mapping.get(ch.id) == progress_key:
             try:
                 await ch.delete()
                 logger.info(f"候補者 {candidate_id} のテキストチャンネル {ch.id} を削除")
             except Exception as e:
                 logger.error(f"テキストチャンネル {ch.id} 削除失敗: {e}")
             data_manager.interview_channel_mapping.pop(ch.id, None)
-    else:
-        # mapping から検索して削除
-        for ch in guild.text_channels:
-            if data_manager.interview_channel_mapping.get(ch.id) == progress_key:
-                try:
-                    await ch.delete()
-                    logger.info(f"候補者 {candidate_id} のテキストチャンネル {ch.id} を削除")
-                except Exception as e:
-                    logger.error(f"テキストチャンネル {ch.id} 削除失敗: {e}")
-                data_manager.interview_channel_mapping.pop(ch.id, None)
-                break
+            break
 
     # ---------- VC 削除 ----------
     # 1) cp 由来の voice_channel_id
+    cp = data_manager.candidate_progress.get(progress_key)
     vc_candidates: list[int] = []
     if cp and cp.get("voice_channel_id"):
         vc_candidates.append(cp["voice_channel_id"])
@@ -1496,6 +1481,20 @@ async def get_candidate_context(
     interviewer = main_guild.get_member(interviewer_id) \
         or await utils.safe_fetch_member(main_guild, interviewer_id)
     if interviewer is None or interviewer_role not in interviewer.roles:
+        await send_error("操作権限がありません。")
+        return None
+
+    # ─────────────────────────────────────────────
+    # 4-B) ボタンを押した人の権限確認
+    #      ・担当者本人、または面接担当ロールを持つメンバーのみ許可
+    # ─────────────────────────────────────────────
+    if not (
+        main_member
+        and (
+            main_member.id == interviewer_id
+            or interviewer_role in main_member.roles
+        )
+    ):
         await send_error("操作権限がありません。")
         return None
 
@@ -2893,7 +2892,8 @@ class EventCog(commands.Cog):
     async def on_member_remove(self, member: discord.Member):
         """
         メンバーがサーバーから退出した際のイベントハンドラ
-        - メイン / サブ問わず、担当者がいる候補者の場合にDMで通知する（面接済みを除く）
+        - メイン / サブ問わず、担当者がいる候補者の場合にDMで通知する
+          （プロフィール審査が完了し、かつ面接済みでない場合）
         - 関連するチャンネルやデータをクリーンアップする
         """
 
@@ -2925,9 +2925,15 @@ class EventCog(commands.Cog):
             if any(r.get("interviewee_id") == member.id for r in data_manager.interview_records):
                 is_interview_completed = True
                 
-        # 担当者が割り当てられており、かつ面接が完了していない場合のみDMを送信
+        # 担当者が割り当てられており、プロフィール審査完了かつ
+        # 面接がまだ完了していない場合のみDMを送信
         interviewer_id = cp.get("interviewer_id")
-        if interviewer_id and not is_interview_completed:
+        if (
+            interviewer_id
+            and cp.get("profile_evaluated")
+            and not is_interview_completed
+            and cp.get("status") != "面接済み"
+        ):
             try:
                 # 担当者のユーザーオブジェクトを取得
                 # 修正点: bot を self.bot に修正
@@ -3002,7 +3008,6 @@ class TaskCog(commands.Cog):
         self.bot = bot
         self.check_candidate_status.start()
         self.schedule_notifications.start()
-        self.cleanup_orphan_channels.start()
 
     @tasks.loop(minutes=5)
     async def check_candidate_status(self) -> None:
@@ -3122,32 +3127,6 @@ class TaskCog(commands.Cog):
                     cp['notified_candidate'] = False
                     cp['notified_interviewer'] = False
                     await data_manager.save_data()
-
-    # ---------- 定期クリーンアップ ----------
-    @tasks.loop(minutes=10)
-    async def cleanup_orphan_channels(self) -> None:
-        for progress_key, cp in list(data_manager.candidate_progress.items()):
-            guild_id = cp.get('source_guild_id', MAIN_GUILD_ID)
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                continue
-            candidate_id = cp.get('candidate_id')
-            if candidate_id is None:
-                continue
-            if guild.get_member(candidate_id):
-                continue
-            try:
-                await delete_candidate_channels(self.bot, guild, candidate_id)
-            except Exception as e:
-                logger.error(f"孤立チャンネル削除失敗: {e}")
-            data_manager.candidate_progress.pop(progress_key, None)
-            await data_manager.save_data()
-            request_dashboard_update(self.bot)
-            logger.info(f"候補者 {candidate_id} の進捗を削除しました (退出検知失敗)")
-
-    @cleanup_orphan_channels.before_loop
-    async def _before_cleanup_orphan_channels(self) -> None:
-        await self.bot.wait_until_ready()
 # ------------------------------------------------
 # DelayedActionManager（遅延アクション管理）
 # ------------------------------------------------
@@ -3513,11 +3492,15 @@ class MessageCog(commands.Cog):
         if current_status in ("プロフィール未記入", "要修正") and looks_like_profile(message.content):
             await self._process_profile(message, cp, progress_key)
         
-        # C-2. プロフィール記入済みや日程調整中で、担当者も決まっている場合
-        elif current_status in ("記入済み", "担当者待ち") and cp.get("interviewer_id"):
+        # C-2. プロフィール審査完了済みで担当者が決まっている場合
+        elif (
+            cp.get("interviewer_id")
+            and cp.get("profile_evaluated")
+            and current_status != "面接済み"
+        ):
             # 候補者からのメンションや返信以外のメッセージを担当者にDM通知
             if not message.mentions and not message.reference:
-                 await notify_interviewer_of_candidate_message(self.bot, cp, message)
+                await notify_interviewer_of_candidate_message(self.bot, cp, message)
 
     # ===== on_message_edit: 編集の処理 ===========================
     @commands.Cog.listener()
