@@ -3376,7 +3376,7 @@ class MessageCog(commands.Cog):
 
     # (on_message, on_message_edit は変更なし)
 
-    # ===== on_message: 新規投稿の処理 ==============================
+    # ===== on_message: 新規投稿の処理 (★このメソッドを置き換えてください★) ==============================
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
@@ -3389,103 +3389,139 @@ class MessageCog(commands.Cog):
             return
 
         cp = data_manager.candidate_progress.get(progress_key)
-        if not cp or cp.get("candidate_id") != message.author.id:
+        if not cp:
             return
 
-        # ──────────────────────────────────────────────
-        # A. イン率確認フェーズへの返答
-        # ──────────────────────────────────────────────
-        if cp.get("pending_inrate_confirmation"):
-            # プロフィール全文を再投稿してきた場合はそのまま評価を行う
-            if looks_like_profile(message.content):
-                cp["pending_inrate_confirmation"] = False
-                await self._process_profile(message, cp, progress_key)
+        # --- A) メッセージ送信者が候補者本人の場合 ---
+        if cp.get("candidate_id") == message.author.id:
+            # 既存の候補者からのメッセージ（プロフィール投稿、質問など）を処理するロジック
+            # ──────────────────────────────────────────────
+            # A-1. イン率確認フェーズへの返答
+            # ──────────────────────────────────────────────
+            if cp.get("pending_inrate_confirmation"):
+                if looks_like_profile(message.content):
+                    cp["pending_inrate_confirmation"] = False
+                    await self._process_profile(message, cp, progress_key)
+                    request_dashboard_update(self.bot)
+                    return
+
+                yn_inrate = await classify_yes_no_ai(message.content, debug=True)
+                if yn_inrate == "YES":
+                    cp["pending_inrate_confirmation"] = False
+                    if cp.get("profile_message_id"):
+                        try:
+                            orig_profile_msg = await message.channel.fetch_message(cp["profile_message_id"])
+                            await self._process_profile(orig_profile_msg, cp, progress_key, inrate_cleared=True)
+                        except discord.NotFound:
+                            await message.reply("元のプロフィールが見つかりませんでした。お手数ですが、再度プロフィール全体を投稿してください。")
+                            update_candidate_status(cp, "プロフィール未記入")
+                            await data_manager.save_data()
+                    else:
+                        await message.reply("イン率について確認いたしました。お手数ですが、再度プロフィール全体をご投稿ください。")
+                        update_candidate_status(cp, "プロフィール未記入")
+                        await data_manager.save_data()
+                elif yn_inrate == "NO":
+                    await message.reply("承知いたしました。今回はお見送りとさせていただきます。")
+                else:
+                    await message.reply("恐れ入ります、イン率については **はい** / **いいえ** でお答えいただけますか？")
                 request_dashboard_update(self.bot)
                 return
 
-            yn_inrate = await classify_yes_no_ai(message.content, debug=True)
+            # ──────────────────────────────────────────────
+            # A-2. 移住予定確認フェーズへの返答
+            # ──────────────────────────────────────────────
+            if cp.get("pending_move_confirmation"):
+                if looks_like_profile(message.content):
+                    cp["pending_move_confirmation"] = False
+                    await self._process_profile(message, cp, progress_key)
+                    request_dashboard_update(self.bot)
+                    return
 
-            if yn_inrate == "YES":
-                cp["pending_inrate_confirmation"] = False # イン率確認はクリア
-                if cp.get("profile_message_id"):
-                    try:
-                        orig_profile_msg = await message.channel.fetch_message(cp["profile_message_id"])
-                        # イン率OKとして、元のプロフィールを再評価
-                        await self._process_profile(orig_profile_msg, cp, progress_key, inrate_cleared=True)
-                    except discord.NotFound:
-                        await message.reply("元のプロフィールが見つかりませんでした。お手数ですが、再度プロフィール全体を投稿してください。")
+                yn_move = await classify_yes_no_ai(message.content, debug=True)
+                if yn_move == "YES":
+                    cp["pending_move_confirmation"] = False
+                    if cp.get("profile_message_id"):
+                        try:
+                            orig_profile_msg = await message.channel.fetch_message(cp["profile_message_id"])
+                            await self._process_profile(orig_profile_msg, cp, progress_key, move_cleared=True)
+                        except discord.NotFound:
+                            await message.reply("元のプロフィールが見つかりませんでした。お手数ですが、再度プロフィール全体を投稿してください。")
+                            update_candidate_status(cp, "プロフィール未記入")
+                            await data_manager.save_data()
+                    else:
+                        await message.reply("移住のご意思は確認いたしました。お手数ですが、再度プロフィール全体をご投稿ください。")
                         update_candidate_status(cp, "プロフィール未記入")
                         await data_manager.save_data()
-                else: # プロフィールが見つからない場合
-                    await message.reply("イン率について確認いたしました。お手数ですが、再度プロフィール全体をご投稿ください。")
-                    update_candidate_status(cp, "プロフィール未記入")
-                    await data_manager.save_data()
-
-            elif yn_inrate == "NO":
-                await message.reply("承知いたしました。今回はお見送りとさせていただきます。")
-                # 不合格処理（キックなど）をここに追加可能
-            else:  # UNSURE
-                await message.reply("恐れ入ります、イン率については **はい** / **いいえ** でお答えいただけますか？")
-            
-            request_dashboard_update(self.bot)
-            return # このメッセージの処理はここまで
-
-        # ──────────────────────────────────────────────
-        # B. 移住予定確認フェーズへの返答
-        # ──────────────────────────────────────────────
-        if cp.get("pending_move_confirmation"):
-            # イン率と同様、再度プロフィールを投稿してきた可能性を考慮
-            if looks_like_profile(message.content):
-                cp["pending_move_confirmation"] = False
-                await self._process_profile(message, cp, progress_key)
+                elif yn_move == "NO":
+                    await message.reply("申し訳ありませんが、今回はお見送りとさせていただきます。")
+                else:
+                    await message.reply("恐れ入ります、移住予定については **はい** / **いいえ** でお答えいただけますか？")
                 request_dashboard_update(self.bot)
                 return
 
-            yn_move = await classify_yes_no_ai(message.content, debug=True)
+            # ──────────────────────────────────────────────
+            # A-3. 通常のプロフィール投稿 or 自由な発言
+            # ──────────────────────────────────────────────
+            current_status = cp.get("status")
+            if current_status in ("プロフィール未記入", "要修正") and looks_like_profile(message.content):
+                await self._process_profile(message, cp, progress_key)
+            elif cp.get("interviewer_id") and cp.get("profile_evaluated") and current_status != "面接済み":
+                if not message.mentions and not message.reference:
+                    await notify_interviewer_of_candidate_message(self.bot, cp, message)
+            return  # 候補者のメッセージ処理はここで終了
 
-            if yn_move == "YES":
-                cp["pending_move_confirmation"] = False # 移住確認はクリア
-                if cp.get("profile_message_id"):
-                    try:
-                        orig_profile_msg = await message.channel.fetch_message(cp["profile_message_id"])
-                        # 移住意思OKとして、元のプロフィールを再評価
-                        await self._process_profile(orig_profile_msg, cp, progress_key, move_cleared=True)
-                    except discord.NotFound:
-                        await message.reply("元のプロフィールが見つかりませんでした。お手数ですが、再度プロフィール全体を投稿してください。")
-                        update_candidate_status(cp, "プロフィール未記入")
-                        await data_manager.save_data()
-                else: # プロフィールが見つからない場合
-                    await message.reply("移住のご意思は確認いたしました。お手数ですが、再度プロフィール全体をご投稿ください。")
-                    update_candidate_status(cp, "プロフィール未記入")
-                    await data_manager.save_data()
-            
-            elif yn_move == "NO":
-                await message.reply("申し訳ありませんが、今回はお見送りとさせていただきます。")
-                 # 不合格処理（キックなど）をここに追加可能
-            else:  # UNSURE
-                await message.reply("恐れ入ります、移住予定については **はい** / **いいえ** でお答えいただけますか？")
 
+        # --- B) メッセージ送信者が候補者以外（面接官を想定）の場合 ---
+        main_guild = self.bot.get_guild(MAIN_GUILD_ID)
+        if not main_guild:
+            return
+
+        # 送信者が面接官ロールを持っているかチェック
+        interviewer_member = main_guild.get_member(message.author.id)
+        interviewer_role = main_guild.get_role(INTERVIEWER_ROLE_ID)
+        if not (interviewer_member and interviewer_role and interviewer_role in interviewer_member.roles):
+            return  # 面接官でなければ何もしない
+
+        # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼ 要件の実装箇所 ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+        # 条件: ステータスが「記入済み」(要連絡！) AND 担当者が未設定
+        #       → メッセージを送信した面接官を担当者に設定する
+        if cp.get("status") == "記入済み" and not cp.get("interviewer_id"):
+            logger.info(f"チャット投稿により、候補者 {cp.get('candidate_id')} の担当者を {interviewer_member.id} に設定します。")
+
+            # 担当者IDを保存
+            cp["interviewer_id"] = interviewer_member.id
+
+            # ステータスを「記入済み」(要連絡！) → 「担当者待ち」(日程調整してね！) に更新
+            update_candidate_status(cp, "担当者待ち")
+
+            # 担当者への割り当て通知を確実に行うためフラグをリセット
+            cp["notified_assignment"] = False
+
+            # 変更を永続化
+            await data_manager.save_data()
+
+            # ダッシュボードを更新
             request_dashboard_update(self.bot)
-            return # このメッセージの処理はここまで
 
-        # ──────────────────────────────────────────────
-        # C. 通常のプロフィール投稿 or 自由な発言
-        # ──────────────────────────────────────────────
-        current_status = cp.get("status")
+            # 担当者にDMで通知
+            target_guild = self.bot.get_guild(cp.get("source_guild_id")) or main_guild
+            candidate_member = await utils.safe_fetch_member(target_guild, cp.get("candidate_id"))
 
-        # C-1. プロフィール未記入/要修正の状態で、プロフィールらしい投稿があった場合
-        if current_status in ("プロフィール未記入", "要修正") and looks_like_profile(message.content):
-            await self._process_profile(message, cp, progress_key)
-        
-        # C-2. プロフィール審査完了済みで担当者が決まっている場合
-        elif (
-            cp.get("interviewer_id")
-            and cp.get("profile_evaluated")
-            and current_status != "面接済み"
-        ):
-            # 候補者からのメンションや返信以外のメッセージを担当者にDM通知
-            if not message.mentions and not message.reference:
-                await notify_interviewer_of_candidate_message(self.bot, cp, message)
+            if candidate_member and isinstance(message.channel, discord.TextChannel):
+                await notify_interviewer_assignment(
+                    interviewer_member,
+                    candidate_member,
+                    message.channel,
+                    cp,
+                )
+                # チャンネルにも担当者が設定されたことを通知
+                await message.channel.send(
+                    f"担当者が {interviewer_member.mention} さんに設定されました。日程調整を進めてください。",
+                    allowed_mentions=discord.AllowedMentions(users=True)  # メンションを有効化
+                )
+            return
+        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲ 要件の実装箇所 ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
 
     # ===== on_message_edit: 編集の処理 ===========================
     @commands.Cog.listener()
