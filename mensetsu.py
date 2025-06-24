@@ -765,7 +765,8 @@ async def evaluate_profile_with_ai(
     - 上記の致命的な不備がなければ、プロフィール全体をチェックしてください。
     - **見つかった不備や確認事項を【すべて】箇条書きでリストアップ**してください。
     - **指摘文言のルール**:
-        - **イン率が条件（実質的に週3日以上）を満たさないと判断した場合**: `活気がある会議を維持するため、参加メンバーは週3日以上の通話参加をお願いしております。もし可能であれば修正お願いします。` という定型文で指摘してください。
+        - **イン率が条件（実質的に週3日以上）を満たさないと判断した場合**: `募集要項に記載の通り、当サーバーでは週3回以上の会議通話へのご参加をお願いしております。
+もし可能であれば修正お願いします。難しい場合はご退出お願いします。` という定型文で指摘してください。
         - **年齢が曖昧な場合** (例: 「20代」): `- 年齢は「20代」ではなく、具体的な数字で記載してください。` と指摘してください。
     - 箇条書きの前後に余計な挨拶や説明は不要です。
 
@@ -980,34 +981,19 @@ async def delete_candidate_channels(
     progress_key = make_progress_key(guild.id, candidate_id)
 
     # ---------- テキストチャンネル削除 ----------
-    cp = data_manager.candidate_progress.get(progress_key)
-    text_channel_id: Optional[int] = None
-    if cp:
-        text_channel_id = cp.get("channel_id")
-
-    if text_channel_id:
-        ch = guild.get_channel(text_channel_id)
-        if isinstance(ch, discord.TextChannel):
+    for ch in guild.text_channels:
+        if data_manager.interview_channel_mapping.get(ch.id) == progress_key:
             try:
                 await ch.delete()
                 logger.info(f"候補者 {candidate_id} のテキストチャンネル {ch.id} を削除")
             except Exception as e:
                 logger.error(f"テキストチャンネル {ch.id} 削除失敗: {e}")
             data_manager.interview_channel_mapping.pop(ch.id, None)
-    else:
-        # mapping から検索して削除
-        for ch in guild.text_channels:
-            if data_manager.interview_channel_mapping.get(ch.id) == progress_key:
-                try:
-                    await ch.delete()
-                    logger.info(f"候補者 {candidate_id} のテキストチャンネル {ch.id} を削除")
-                except Exception as e:
-                    logger.error(f"テキストチャンネル {ch.id} 削除失敗: {e}")
-                data_manager.interview_channel_mapping.pop(ch.id, None)
-                break
+            break
 
     # ---------- VC 削除 ----------
     # 1) cp 由来の voice_channel_id
+    cp = data_manager.candidate_progress.get(progress_key)
     vc_candidates: list[int] = []
     if cp and cp.get("voice_channel_id"):
         vc_candidates.append(cp["voice_channel_id"])
@@ -1500,6 +1486,20 @@ async def get_candidate_context(
         return None
 
     # ─────────────────────────────────────────────
+    # 4-B) ボタンを押した人の権限確認
+    #      ・担当者本人、または面接担当ロールを持つメンバーのみ許可
+    # ─────────────────────────────────────────────
+    if not (
+        main_member
+        and (
+            main_member.id == interviewer_id
+            or interviewer_role in main_member.roles
+        )
+    ):
+        await send_error("操作権限がありません。")
+        return None
+
+    # ─────────────────────────────────────────────
     # 5) 対象候補者 (guild / member) を探す
     # ─────────────────────────────────────────────
     guild_ids: list[int] = []
@@ -1587,7 +1587,13 @@ async def process_immediate_action(
         )
 
     try:
-        # ① 面接記録追加 & 進捗削除 ----------------------------------------
+        # --- 1. チャンネル削除 --------------------------------------------
+        try:
+            await delete_candidate_channels(interaction.client, target_guild, candidate_id)
+        except Exception as e:
+            logger.error(f"候補者チャンネル削除失敗: {e}")
+
+        # --- 2. 面接記録追加 & 進捗削除 -----------------------------------
         data_manager.interview_records.append({
             "date":          get_current_time_iso(),
             "interviewer_id": cp["interviewer_id"],
@@ -1598,7 +1604,7 @@ async def process_immediate_action(
         data_manager.candidate_progress.pop(progress_key, None)
         await data_manager.save_data()
 
-        # ② ダッシュボード & 統計更新 --------------------------------------
+        # --- 3. ダッシュボード & 統計更新 ---------------------------------
         request_dashboard_update(interaction.client)
         asyncio.create_task(update_stats(interaction.client))
         await update_memo_result_simple(target_member, action_type.upper())
@@ -1623,6 +1629,8 @@ async def process_immediate_action(
             f"{'✅ キック完了' if kicked else '⚠️ キックに失敗 / 既にいません'}"
         )
         await interaction.followup.send(msg, ephemeral=True)
+
+
 
     except Exception as e:
         logger.error(f"process_immediate_action 全体失敗: {e}", exc_info=True)
@@ -1655,6 +1663,7 @@ async def register_delayed_action(
         "id": str(uuid.uuid4()),
         "action_type": action_type,
         "candidate_id": candidate_id,
+        "progress_key": context.progress_key,  # 実行時に進捗を削除するためキーを渡す
         "scheduled_time": tomorrow_9.isoformat(),
         "apply_all": target_guild.id == MAIN_GUILD_ID,
         **({} if target_guild.id == MAIN_GUILD_ID else {"guild_id": target_guild.id})
@@ -1662,8 +1671,7 @@ async def register_delayed_action(
     await delayed_action_manager.add(action)
 
     # --- 面接記録・進捗 ----------------------------------------------------
-    update_candidate_status(cp, action_type.upper())
-    data_manager.candidate_progress.pop(context.progress_key, None)
+    update_candidate_status(cp, f"DELAY_{action_type.upper()}")
     data_manager.interview_records.append({
         "date":          get_current_time_iso(),
         "interviewer_id": cp["interviewer_id"],
@@ -1673,8 +1681,7 @@ async def register_delayed_action(
     await data_manager.save_data()
 
     # --- UI 更新 ----------------------------------------------------------
-    request_dashboard_update(interaction.client)
-    asyncio.create_task(update_stats(interaction.client))          # ★ 追加
+    asyncio.create_task(update_stats(interaction.client))
 
     await interaction.followup.send(
         f"{target_member.mention} の **{action_type.upper()}** を "
@@ -2886,58 +2893,49 @@ class EventCog(commands.Cog):
                 request_dashboard_update(self.bot)
                 logger.info(f"候補者 {progress_key} の進捗削除 (チャンネル削除)")
 
-    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-    # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼ 修正箇所 ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
         """
         メンバーがサーバーから退出した際のイベントハンドラ
-        - メイン / サブ問わず、担当者がいる候補者の場合にDMで通知する（面接済みを除く）
+        - メイン / サブ問わず、担当者がいる候補者の場合にDMで通知する
+        （面接がまだ完了していない場合）
         - 関連するチャンネルやデータをクリーンアップする
         """
-
-        # 退出したメンバーが管理対象の「候補者」であったかを確認
         progress_key = make_progress_key(member.guild.id, member.id)
         cp = data_manager.candidate_progress.get(progress_key)
 
-        # 候補者データが存在しない場合は、ここで処理を終了
         if not cp:
             return
 
         logger.info(f"候補者 '{member.display_name}' ({member.id}) がサーバーから退出しました。クリーンアップ処理を開始します。")
 
-        # --- 担当者への通知判定 ---
-        is_interview_completed = False
-        
-        # 1. 完了済みステータスで判定
-        # 面接が完了したことを示すステータスのセット
+        # --- 面接が完了していたかどうかの判定ロジックを整理 ---
         completed_statuses = {
             'PASS_NOTIFIED', 'DELAY_PASS', 'FAIL_NOTIFIED', 'DELAY_FAIL',
-            'BAN_NOTIFIED', 'DELAY_BAN', 'INTERVAL_NOTIFIED', 'DELAY_INTERVAL'
+            'BAN_NOTIFIED', 'DELAY_BAN', 'INTERVAL_NOTIFIED', 'DELAY_INTERVAL',
+            '面接済み'  # このステータスも完了とみなす
         }
-        if cp.get("status") in completed_statuses:
-            is_interview_completed = True
 
-        # 2. 面接記録(interview_records)の有無で判定 (より確実)
-        if not is_interview_completed:
-            # 修正点: キーを "candidate_id" から "interviewee_id" に修正
-            if any(r.get("interviewee_id") == member.id for r in data_manager.interview_records):
-                is_interview_completed = True
-                
-        # 担当者が割り当てられており、かつ面接が完了していない場合のみDMを送信
+        # interview_records内のIDは文字列の可能性があるため str() で比較
+        has_interview_record = any(
+            str(r.get("candidate_id")) == str(member.id)
+            for r in data_manager.interview_records
+        )
+        
+        # 「完了ステータス」または「面接記録あり」のいずれかで完了とみなす
+        is_interview_completed = (cp.get("status") in completed_statuses) or has_interview_record
+        
+        # --- 担当者への通知 ---
         interviewer_id = cp.get("interviewer_id")
+        
+        # ★ 修正点2: 通知条件を「担当者がいて、かつ面接未完了」に簡素化 ★
         if interviewer_id and not is_interview_completed:
             try:
-                # 担当者のユーザーオブジェクトを取得
-                # 修正点: bot を self.bot に修正
                 interviewer = await self.bot.fetch_user(interviewer_id)
                 if interviewer:
-                    # 担当者へDMを送信
                     await interviewer.send(
                         f"【担当候補者 サーバー退出のお知らせ】\n\n"
                         f"担当されていた候補者「{member.display_name}」さんがサーバーから退出しました。\n"
-                        f"関連データは自動的にクリーンアップされます。"
                     )
                     logger.info(f"候補者 {member.id} の退出を担当者 {interviewer_id} にDMで通知しました。")
             except discord.NotFound:
@@ -2946,25 +2944,24 @@ class EventCog(commands.Cog):
                 logger.warning(f"担当者 {interviewer_id} へのDMがブロックされており、退出DMを送信できませんでした。")
             except Exception as e:
                 logger.error(f"担当者への退出通知DM送信中に予期せぬエラーが発生しました: {e}", exc_info=True)
-
+        else:
+            # (改善) 通知しなかった場合に理由をログ出力し、デバッグしやすくする
+            if interviewer_id:
+                reason = "面接完了済みのため"
+            else:
+                reason = "担当者が未設定のため"
+            logger.info(f"候補者 {member.id} の退出通知は送信しませんでした。理由: {reason}")
 
         # --- 候補者データのクリーンアップ処理 ---
-        
-        # 1. 関連するテキストチャンネル・ボイスチャンネルを削除
         try:
-            # 修正点: bot を self.bot に修正
             await delete_candidate_channels(self.bot, member.guild, member.id)
         except Exception as e:
             logger.error(f"退出した候補者 {member.id} のチャンネル削除中にエラーが発生しました: {e}", exc_info=True)
 
-        # 2. `candidate_progress` から該当候補者のデータを削除
         if progress_key in data_manager.candidate_progress:
             del data_manager.candidate_progress[progress_key]
             await data_manager.save_data()
             logger.info(f"退出した候補者 {member.id} の進捗データを削除しました。")
-
-            # 3. ダッシュボードの表示を最新の状態に更新
-            # 修正点: bot を self.bot に修正
             request_dashboard_update(self.bot)
 
     @commands.Cog.listener()
@@ -3002,7 +2999,6 @@ class TaskCog(commands.Cog):
         self.bot = bot
         self.check_candidate_status.start()
         self.schedule_notifications.start()
-        self.cleanup_orphan_channels.start()
 
     @tasks.loop(minutes=5)
     async def check_candidate_status(self) -> None:
@@ -3122,32 +3118,6 @@ class TaskCog(commands.Cog):
                     cp['notified_candidate'] = False
                     cp['notified_interviewer'] = False
                     await data_manager.save_data()
-
-    # ---------- 定期クリーンアップ ----------
-    @tasks.loop(minutes=10)
-    async def cleanup_orphan_channels(self) -> None:
-        for progress_key, cp in list(data_manager.candidate_progress.items()):
-            guild_id = cp.get('source_guild_id', MAIN_GUILD_ID)
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                continue
-            candidate_id = cp.get('candidate_id')
-            if candidate_id is None:
-                continue
-            if guild.get_member(candidate_id):
-                continue
-            try:
-                await delete_candidate_channels(self.bot, guild, candidate_id)
-            except Exception as e:
-                logger.error(f"孤立チャンネル削除失敗: {e}")
-            data_manager.candidate_progress.pop(progress_key, None)
-            await data_manager.save_data()
-            request_dashboard_update(self.bot)
-            logger.info(f"候補者 {candidate_id} の進捗を削除しました (退出検知失敗)")
-
-    @cleanup_orphan_channels.before_loop
-    async def _before_cleanup_orphan_channels(self) -> None:
-        await self.bot.wait_until_ready()
 # ------------------------------------------------
 # DelayedActionManager（遅延アクション管理）
 # ------------------------------------------------
@@ -3239,6 +3209,8 @@ class DelayedActionManager:
 async def execute_delayed_action(action: dict, bot: commands.Bot):
     candidate_id = action["candidate_id"]
     action_type = action["action_type"]
+    progress_key = action.get("progress_key")
+
     if action_type == "ban":
         reason = "BAN (遅延キック)"
     elif action_type == "fail":
@@ -3248,39 +3220,32 @@ async def execute_delayed_action(action: dict, bot: commands.Bot):
     else:
         logger.error(f"不明なアクション種別: {action_type}")
         return
-    apply_all = action.get("apply_all", False)
 
-    if apply_all:
-        for guild in bot.guilds:
-            try:
-                member = guild.get_member(candidate_id) or await guild.fetch_member(candidate_id)
-                if member:
-                    try:
-                        await guild.kick(member, reason=reason)
-                        logger.info(f"Guild {guild.id} で候補者 {candidate_id} に対して {action_type} 遅延処理実行")
-                        # ★ 追記: 自動キックログ
-                        await log_auto_kick(bot, member, guild, reason)
-                    except Exception as e:
-                        logger.error(f"Guild {guild.id} での遅延処理 {action_type} 失敗: {e}")
-            except Exception as e:
-                logger.error(f"Guild {guild.id} で候補者 {candidate_id} の取得失敗: {e}")
-    else:
-        guild_id = action.get("guild_id")
-        if guild_id is not None:
-            guild = bot.get_guild(guild_id)
-            if guild:
-                try:
-                    member = guild.get_member(candidate_id) or await guild.fetch_member(candidate_id)
-                    if member:
-                        try:
-                            await guild.kick(member, reason=reason)
-                            logger.info(f"Guild {guild_id} で候補者 {candidate_id} に対して {action_type} 遅延処理実行")
-                            # ★ 追記: 自動キックログ
-                            await log_auto_kick(bot, member, guild, reason)
-                        except Exception as e:
-                            logger.error(f"Guild {guild_id} での遅延処理 {action_type} 失敗: {e}")
-                except Exception as e:
-                    logger.error(f"Guild {guild_id} で候補者 {candidate_id} の取得失敗: {e}")
+    apply_all = action.get("apply_all", False)
+    guilds_to_process = bot.guilds if apply_all else [bot.get_guild(action.get("guild_id"))]
+
+    for guild in guilds_to_process:
+        if not guild:
+            continue
+        try:
+            # 1. チャンネル削除
+            await delete_candidate_channels(bot, guild, candidate_id)
+
+            # 2. キック
+            member = guild.get_member(candidate_id) or await guild.fetch_member(candidate_id)
+            if member:
+                await guild.kick(member, reason=reason)
+                logger.info(f"Guild {guild.id} で候補者 {candidate_id} に対して {action_type} 遅延処理実行")
+                await log_auto_kick(bot, member, guild, reason)
+        except Exception as e:
+            logger.error(f"Guild {guild.id} での遅延処理失敗（候補者: {candidate_id}）: {e}")
+
+    # 3. 進捗データ削除
+    if progress_key and progress_key in data_manager.candidate_progress:
+        del data_manager.candidate_progress[progress_key]
+        await data_manager.save_data()
+        request_dashboard_update(bot)
+        logger.info(f"遅延処理完了に伴い、候補者 {candidate_id} の進捗データを削除しました。")
 
 # ------------------------------------------------
 # DelayedActionCog（遅延アクションの実行）
@@ -3412,7 +3377,7 @@ class MessageCog(commands.Cog):
 
     # (on_message, on_message_edit は変更なし)
 
-    # ===== on_message: 新規投稿の処理 ==============================
+    # ===== on_message: 新規投稿の処理 (★このメソッドを置き換えてください★) ==============================
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
@@ -3425,99 +3390,139 @@ class MessageCog(commands.Cog):
             return
 
         cp = data_manager.candidate_progress.get(progress_key)
-        if not cp or cp.get("candidate_id") != message.author.id:
+        if not cp:
             return
 
-        # ──────────────────────────────────────────────
-        # A. イン率確認フェーズへの返答
-        # ──────────────────────────────────────────────
-        if cp.get("pending_inrate_confirmation"):
-            # プロフィール全文を再投稿してきた場合はそのまま評価を行う
-            if looks_like_profile(message.content):
-                cp["pending_inrate_confirmation"] = False
-                await self._process_profile(message, cp, progress_key)
+        # --- A) メッセージ送信者が候補者本人の場合 ---
+        if cp.get("candidate_id") == message.author.id:
+            # 既存の候補者からのメッセージ（プロフィール投稿、質問など）を処理するロジック
+            # ──────────────────────────────────────────────
+            # A-1. イン率確認フェーズへの返答
+            # ──────────────────────────────────────────────
+            if cp.get("pending_inrate_confirmation"):
+                if looks_like_profile(message.content):
+                    cp["pending_inrate_confirmation"] = False
+                    await self._process_profile(message, cp, progress_key)
+                    request_dashboard_update(self.bot)
+                    return
+
+                yn_inrate = await classify_yes_no_ai(message.content, debug=True)
+                if yn_inrate == "YES":
+                    cp["pending_inrate_confirmation"] = False
+                    if cp.get("profile_message_id"):
+                        try:
+                            orig_profile_msg = await message.channel.fetch_message(cp["profile_message_id"])
+                            await self._process_profile(orig_profile_msg, cp, progress_key, inrate_cleared=True)
+                        except discord.NotFound:
+                            await message.reply("元のプロフィールが見つかりませんでした。お手数ですが、再度プロフィール全体を投稿してください。")
+                            update_candidate_status(cp, "プロフィール未記入")
+                            await data_manager.save_data()
+                    else:
+                        await message.reply("イン率について確認いたしました。お手数ですが、再度プロフィール全体をご投稿ください。")
+                        update_candidate_status(cp, "プロフィール未記入")
+                        await data_manager.save_data()
+                elif yn_inrate == "NO":
+                    await message.reply("承知いたしました。今回はお見送りとさせていただきます。")
+                else:
+                    await message.reply("恐れ入ります、イン率については **はい** / **いいえ** でお答えいただけますか？")
                 request_dashboard_update(self.bot)
                 return
 
-            yn_inrate = await classify_yes_no_ai(message.content, debug=True)
+            # ──────────────────────────────────────────────
+            # A-2. 移住予定確認フェーズへの返答
+            # ──────────────────────────────────────────────
+            if cp.get("pending_move_confirmation"):
+                if looks_like_profile(message.content):
+                    cp["pending_move_confirmation"] = False
+                    await self._process_profile(message, cp, progress_key)
+                    request_dashboard_update(self.bot)
+                    return
 
-            if yn_inrate == "YES":
-                cp["pending_inrate_confirmation"] = False # イン率確認はクリア
-                if cp.get("profile_message_id"):
-                    try:
-                        orig_profile_msg = await message.channel.fetch_message(cp["profile_message_id"])
-                        # イン率OKとして、元のプロフィールを再評価
-                        await self._process_profile(orig_profile_msg, cp, progress_key, inrate_cleared=True)
-                    except discord.NotFound:
-                        await message.reply("元のプロフィールが見つかりませんでした。お手数ですが、再度プロフィール全体を投稿してください。")
+                yn_move = await classify_yes_no_ai(message.content, debug=True)
+                if yn_move == "YES":
+                    cp["pending_move_confirmation"] = False
+                    if cp.get("profile_message_id"):
+                        try:
+                            orig_profile_msg = await message.channel.fetch_message(cp["profile_message_id"])
+                            await self._process_profile(orig_profile_msg, cp, progress_key, move_cleared=True)
+                        except discord.NotFound:
+                            await message.reply("元のプロフィールが見つかりませんでした。お手数ですが、再度プロフィール全体を投稿してください。")
+                            update_candidate_status(cp, "プロフィール未記入")
+                            await data_manager.save_data()
+                    else:
+                        await message.reply("移住のご意思は確認いたしました。お手数ですが、再度プロフィール全体をご投稿ください。")
                         update_candidate_status(cp, "プロフィール未記入")
                         await data_manager.save_data()
-                else: # プロフィールが見つからない場合
-                    await message.reply("イン率について確認いたしました。お手数ですが、再度プロフィール全体をご投稿ください。")
-                    update_candidate_status(cp, "プロフィール未記入")
-                    await data_manager.save_data()
-
-            elif yn_inrate == "NO":
-                await message.reply("承知いたしました。今回はお見送りとさせていただきます。")
-                # 不合格処理（キックなど）をここに追加可能
-            else:  # UNSURE
-                await message.reply("恐れ入ります、イン率については **はい** / **いいえ** でお答えいただけますか？")
-            
-            request_dashboard_update(self.bot)
-            return # このメッセージの処理はここまで
-
-        # ──────────────────────────────────────────────
-        # B. 移住予定確認フェーズへの返答
-        # ──────────────────────────────────────────────
-        if cp.get("pending_move_confirmation"):
-            # イン率と同様、再度プロフィールを投稿してきた可能性を考慮
-            if looks_like_profile(message.content):
-                cp["pending_move_confirmation"] = False
-                await self._process_profile(message, cp, progress_key)
+                elif yn_move == "NO":
+                    await message.reply("申し訳ありませんが、今回はお見送りとさせていただきます。")
+                else:
+                    await message.reply("恐れ入ります、移住予定については **はい** / **いいえ** でお答えいただけますか？")
                 request_dashboard_update(self.bot)
                 return
 
-            yn_move = await classify_yes_no_ai(message.content, debug=True)
+            # ──────────────────────────────────────────────
+            # A-3. 通常のプロフィール投稿 or 自由な発言
+            # ──────────────────────────────────────────────
+            current_status = cp.get("status")
+            if current_status in ("プロフィール未記入", "要修正") and looks_like_profile(message.content):
+                await self._process_profile(message, cp, progress_key)
+            elif cp.get("interviewer_id") and cp.get("profile_evaluated") and current_status != "面接済み":
+                if not message.mentions and not message.reference:
+                    await notify_interviewer_of_candidate_message(self.bot, cp, message)
+            return  # 候補者のメッセージ処理はここで終了
 
-            if yn_move == "YES":
-                cp["pending_move_confirmation"] = False # 移住確認はクリア
-                if cp.get("profile_message_id"):
-                    try:
-                        orig_profile_msg = await message.channel.fetch_message(cp["profile_message_id"])
-                        # 移住意思OKとして、元のプロフィールを再評価
-                        await self._process_profile(orig_profile_msg, cp, progress_key, move_cleared=True)
-                    except discord.NotFound:
-                        await message.reply("元のプロフィールが見つかりませんでした。お手数ですが、再度プロフィール全体を投稿してください。")
-                        update_candidate_status(cp, "プロフィール未記入")
-                        await data_manager.save_data()
-                else: # プロフィールが見つからない場合
-                    await message.reply("移住のご意思は確認いたしました。お手数ですが、再度プロフィール全体をご投稿ください。")
-                    update_candidate_status(cp, "プロフィール未記入")
-                    await data_manager.save_data()
-            
-            elif yn_move == "NO":
-                await message.reply("申し訳ありませんが、今回はお見送りとさせていただきます。")
-                 # 不合格処理（キックなど）をここに追加可能
-            else:  # UNSURE
-                await message.reply("恐れ入ります、移住予定については **はい** / **いいえ** でお答えいただけますか？")
 
+        # --- B) メッセージ送信者が候補者以外（面接官を想定）の場合 ---
+        main_guild = self.bot.get_guild(MAIN_GUILD_ID)
+        if not main_guild:
+            return
+
+        # 送信者が面接官ロールを持っているかチェック
+        interviewer_member = main_guild.get_member(message.author.id)
+        interviewer_role = main_guild.get_role(INTERVIEWER_ROLE_ID)
+        if not (interviewer_member and interviewer_role and interviewer_role in interviewer_member.roles):
+            return  # 面接官でなければ何もしない
+
+        # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼ 要件の実装箇所 ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+        # 条件: ステータスが「記入済み」(要連絡！) AND 担当者が未設定
+        #       → メッセージを送信した面接官を担当者に設定する
+        if cp.get("status") == "記入済み" and not cp.get("interviewer_id"):
+            logger.info(f"チャット投稿により、候補者 {cp.get('candidate_id')} の担当者を {interviewer_member.id} に設定します。")
+
+            # 担当者IDを保存
+            cp["interviewer_id"] = interviewer_member.id
+
+            # ステータスを「記入済み」(要連絡！) → 「担当者待ち」(日程調整してね！) に更新
+            update_candidate_status(cp, "担当者待ち")
+
+            # 担当者への割り当て通知を確実に行うためフラグをリセット
+            cp["notified_assignment"] = False
+
+            # 変更を永続化
+            await data_manager.save_data()
+
+            # ダッシュボードを更新
             request_dashboard_update(self.bot)
-            return # このメッセージの処理はここまで
 
-        # ──────────────────────────────────────────────
-        # C. 通常のプロフィール投稿 or 自由な発言
-        # ──────────────────────────────────────────────
-        current_status = cp.get("status")
+            # 担当者にDMで通知
+            target_guild = self.bot.get_guild(cp.get("source_guild_id")) or main_guild
+            candidate_member = await utils.safe_fetch_member(target_guild, cp.get("candidate_id"))
 
-        # C-1. プロフィール未記入/要修正の状態で、プロフィールらしい投稿があった場合
-        if current_status in ("プロフィール未記入", "要修正") and looks_like_profile(message.content):
-            await self._process_profile(message, cp, progress_key)
-        
-        # C-2. プロフィール記入済みや日程調整中で、担当者も決まっている場合
-        elif current_status in ("記入済み", "担当者待ち") and cp.get("interviewer_id"):
-            # 候補者からのメンションや返信以外のメッセージを担当者にDM通知
-            if not message.mentions and not message.reference:
-                 await notify_interviewer_of_candidate_message(self.bot, cp, message)
+            if candidate_member and isinstance(message.channel, discord.TextChannel):
+                await notify_interviewer_assignment(
+                    interviewer_member,
+                    candidate_member,
+                    message.channel,
+                    cp,
+                )
+                # チャンネルにも担当者が設定されたことを通知
+                await message.channel.send(
+                    f"担当者が {interviewer_member.mention} さんに設定されました。日程調整を進めてください。",
+                    allowed_mentions=discord.AllowedMentions(users=True)  # メンションを有効化
+                )
+            return
+        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲ 要件の実装箇所 ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
 
     # ===== on_message_edit: 編集の処理 ===========================
     @commands.Cog.listener()
